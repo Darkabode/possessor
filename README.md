@@ -1,7 +1,5 @@
 # Intro
 
-Project nane: *Possessor*
-
 User-mode part of Zerokit platform.
 
 Partially based on PowerLoader.
