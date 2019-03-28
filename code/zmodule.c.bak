@@ -1,0 +1,164 @@
+typedef struct _image_reloc
+{
+    uint16_t offset:12;
+    uint16_t type:4;
+} image_reloc_t, *pimage_reloc_t;
+
+typedef int (*FnZModuleEntry)(pzmodule_block_t pZModuleBlock);
+
+int zmodule_run(uint8_t* pModule)
+{
+    PIMAGE_DOS_HEADER dosHdr;
+    PIMAGE_NT_HEADERS ntHdrs, newNtHdrs;
+    uint32_t* addressOfFunctions;
+    uint32_t exportSize;
+    FnZModuleEntry fnZModuleEntry = NULL;
+    uint8_t* newBase = NULL;
+    uintptr_t locationDelta;
+    uint32_t i;
+    PIMAGE_EXPORT_DIRECTORY pExports;
+    PIMAGE_SECTION_HEADER pSection;
+    uint16_t numberOfSections;
+    PIMAGE_DATA_DIRECTORY pDirectory;
+    PIMAGE_IMPORT_DESCRIPTOR pImportDesc;
+    uint8_t* moduleBase;
+    uintptr_t* thunkRef;
+    uintptr_t* funcRef;
+    uintptr_t dwAddressArray;
+    PIMAGE_DATA_DIRECTORY dwNameArray;
+    PIMAGE_BASE_RELOCATION pReloc;
+    int ret = 1;
+    uint8_t* origBuffer = (uint8_t*)pModule;
+
+    do {
+        dosHdr = (PIMAGE_DOS_HEADER)origBuffer;
+        ntHdrs = (PIMAGE_NT_HEADERS)(origBuffer + dosHdr->e_lfanew);
+
+        // Резервируем память для нашего образа
+        newBase = (uint8_t*)gpGlobalData.fnVirtualAlloc(NULL, ntHdrs->OptionalHeader.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (newBase == NULL) {
+            break;
+        }
+
+        // Копируем PE-заголовок, включая MZ-заголовк с DOS-стабом.
+        __movsb((unsigned char*)newBase, (unsigned char const*)origBuffer, (size_t)ntHdrs->OptionalHeader.SizeOfHeaders);
+        newNtHdrs = (PIMAGE_NT_HEADERS)(newBase + dosHdr->e_lfanew);
+
+        // Обновляем базу
+        newNtHdrs->OptionalHeader.ImageBase = (uintptr_t)newBase;
+
+        // Копируем все секции.
+        pSection = IMAGE_FIRST_SECTION(newNtHdrs);
+        numberOfSections = newNtHdrs->FileHeader.NumberOfSections;
+
+        for (i = 0; i < numberOfSections; ++i, ++pSection) {
+            __movsb(newBase + pSection->VirtualAddress, origBuffer + pSection->PointerToRawData, pSection->SizeOfRawData);
+        }
+
+        // Обрабатываем таблицу импорта.
+        pDirectory = &newNtHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+        if (pDirectory->VirtualAddress != 0) {
+            pImportDesc = (PIMAGE_IMPORT_DESCRIPTOR)(newBase + pDirectory->VirtualAddress);
+            for ( ; pImportDesc->Name; ++pImportDesc) {
+                char* dllName = (char*)(newBase + pImportDesc->Name);
+
+                moduleBase = gpGlobalData.fnLoadLibraryA(dllName);
+                if (moduleBase == NULL) {
+                    goto exit;
+                }
+                DbgMsg("Import module loaded: %s", dllName);
+
+                if (pImportDesc->OriginalFirstThunk) {
+                    thunkRef = (uintptr_t*)(newBase + pImportDesc->OriginalFirstThunk);
+                    funcRef = (uintptr_t*)(newBase + pImportDesc->FirstThunk);
+                }
+                else {
+                    // no hint table
+                    thunkRef = (uintptr_t*)(newBase + pImportDesc->FirstThunk);
+                    funcRef = (uintptr_t*)(newBase + pImportDesc->FirstThunk);
+                }
+
+                for ( ; *thunkRef; ++funcRef, ++thunkRef) {
+                    if (IMAGE_SNAP_BY_ORDINAL(*thunkRef)) {
+                        DbgMsg("Import symbol: %08x", *thunkRef);
+                        *funcRef = (uintptr_t)gpGlobalData.fnGetProcAddress(moduleBase, (LPCSTR)IMAGE_ORDINAL(*thunkRef));
+                    }
+                    else {
+                        PIMAGE_IMPORT_BY_NAME thunkData = (PIMAGE_IMPORT_BY_NAME)(newBase + *thunkRef);
+                        DbgMsg("Import symbol: %s", thunkData->Name);
+                        *funcRef = (uintptr_t)gpGlobalData.fnGetProcAddress(moduleBase, thunkData->Name);
+                    }
+                    if (*funcRef == 0) {
+                        DbgMsg("*funcRef = NULL!!!");
+                        goto exit;
+                    }
+                }
+            }
+        }
+
+        // Обрабатываем релоки.
+        locationDelta = (newBase - (unsigned char*)ntHdrs->OptionalHeader.ImageBase);
+        pDirectory = &newNtHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+
+        if (pDirectory->Size > 0) {
+            pReloc = (PIMAGE_BASE_RELOCATION)(newBase + pDirectory->VirtualAddress);
+            for ( ; pReloc->SizeOfBlock != 0; ) {
+                uint8_t* dest = newBase + pReloc->VirtualAddress;
+                image_reloc_t* relInfo = (image_reloc_t*)((uint8_t*)pReloc + sizeof(IMAGE_BASE_RELOCATION));
+                for (i = ((pReloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(image_reloc_t)); i > 0; --i, ++relInfo) {
+#ifdef _WIN64
+                    if (relInfo->type == IMAGE_REL_BASED_DIR64) {
+                        *(uintptr_t*)(dest + relInfo->offset) += locationDelta;
+                    }
+                    else
+#endif
+                        if (relInfo->type == IMAGE_REL_BASED_HIGHLOW) {
+                            *(uint32_t*)(dest + relInfo->offset) += (uint32_t)locationDelta;
+                        }
+                        else if (relInfo->type == IMAGE_REL_BASED_HIGH) {
+                            *(uint16_t*)(dest + relInfo->offset) += HIWORD(locationDelta);
+                        }
+                        else if (relInfo->type == IMAGE_REL_BASED_LOW) {
+                            *(uint16_t*)(dest + relInfo->offset) += LOWORD(locationDelta);
+                        }
+                }
+
+                // Переходим к следующей таблице с релоками.
+                pReloc = (PIMAGE_BASE_RELOCATION)((uint8_t*)pReloc + pReloc->SizeOfBlock);
+            }
+        }
+
+
+        dosHdr = (PIMAGE_DOS_HEADER)newBase;
+        ntHdrs = (PIMAGE_NT_HEADERS)(newBase + dosHdr->e_lfanew);
+        // Ищем функцию с нулевым индексом (1 ординал).
+        pExports = (PIMAGE_EXPORT_DIRECTORY)(newBase + ntHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+        exportSize = ntHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+
+        // Должна быть таблица экспорта с ненулевым размером и двумя ординалами  @1 и @2.
+        if ((uint8_t*)pExports == newBase || exportSize == 0 || pExports->Base != 1 || pExports->NumberOfFunctions != 1) {
+            break;
+        }
+
+        addressOfFunctions = (uint32_t*)(newBase +  pExports->AddressOfFunctions);
+
+        // Смещения не должны быть нулевыми.
+        if (addressOfFunctions[0] == 0) {
+            break;
+        }
+
+        fnZModuleEntry = (pvoid_t)(newBase + addressOfFunctions[0]);
+
+        // Проверяем является ли адрес форвардным.
+        if (((uint8_t*)fnZModuleEntry >= (uint8_t*)pExports) && ((uint8_t*)fnZModuleEntry < ((uint8_t*)pExports + exportSize))) {
+            break;
+        }
+
+        gpGlobalData.zmoduleBlock.selfBase = newBase;
+        ret = fnZModuleEntry(&gpGlobalData.zmoduleBlock);
+    } while (0);
+exit:
+    utils_free(newBase);
+    return ret;
+}
