@@ -1,0 +1,5 @@
+EXPORTS
+security_install_by_ptr @1 NONAME
+security_install @2 NONAME
+mlsc64 @3 NONAME
+mlscsz @4 NONAME
